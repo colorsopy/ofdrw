@@ -24,8 +24,10 @@ import org.ofdrw.sign.stamppos.StampAppearance;
 import java.io.Closeable;
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -105,6 +107,12 @@ public class OFDSigner implements Closeable {
     private Path out;
 
     /**
+     * 是否已经执行exeSign
+     */
+    private boolean hasSign;
+
+
+    /**
      * 不允许调用无参数构造器
      */
     private OFDSigner() {
@@ -116,7 +124,7 @@ public class OFDSigner implements Closeable {
      * @param reader OFD解析器
      * @param out    电子签名后文件保存位置
      */
-    public OFDSigner(OFDReader reader, Path out) {
+    public OFDSigner(OFDReader reader, Path out) throws SignatureTerminateException {
         if (reader == null) {
             throw new IllegalArgumentException("OFD解析器（reader）为空");
         }
@@ -127,7 +135,7 @@ public class OFDSigner implements Closeable {
         this.reader = reader;
         this.out = out;
         this.ofdDir = reader.getOFDDir();
-
+        this.hasSign = false;
         apList = new LinkedList<>();
         // 默认采用 保护整个文档的数字签名模式
         signMode = SignMode.WholeProtected;
@@ -194,8 +202,10 @@ public class OFDSigner implements Closeable {
      * 1. 是否需要根性OFD.xml。
      * <p>
      * 2. 是否可以继续数字签名，如果Signatures.xml被包含到SignInfo中，那么则不能再继续签名。
+     *
+     * @throws SignatureTerminateException 不允许继续签名
      */
-    private void preChecker() {
+    private void preChecker() throws SignatureTerminateException {
         ResourceLocator rl = reader.getResourceLocator();
         try {
             rl.save();
@@ -247,7 +257,7 @@ public class OFDSigner implements Closeable {
 
         // 获取OFD容器在文件系统中的路径
         Path containerPath = ofdDir.getContainerPath();
-        // 文件系统中的容器Unix类型绝对路径，如："/Doc_0/Pages"
+        // 文件系统中的容器Unix类型绝对路径，如："/home/root/tmp"
         String sysRoot = FilenameUtils.separatorsToUnix(containerPath.toAbsolutePath().toString());
         // 遍历OFD文件目录中的所有文件
         Files.walkFileTree(containerPath, new SimpleFileVisitor<Path>() {
@@ -270,6 +280,7 @@ public class OFDSigner implements Closeable {
         return res;
     }
 
+
     /**
      * 签名或签章执行器
      * <p>
@@ -280,11 +291,15 @@ public class OFDSigner implements Closeable {
      * 3. 计算签名值。
      *
      * @return Signatures 列表对象
-     * @throws BadOFDException    文件解析失败，或文件不存在
-     * @throws IOException        签名和文件读写过程中的IO异常
-     * @throws SignatureException 签名异常
+     * @throws BadOFDException          文件解析失败，或文件不存在
+     * @throws IOException              签名和文件读写过程中的IO异常
+     * @throws GeneralSecurityException 签名异常
      */
-    private Signatures exeSign() throws IOException {
+    public Signatures exeSign() throws IOException, GeneralSecurityException {
+        if (signContainer == null) {
+            throw new IllegalArgumentException("签名实现容器（signContainer）为空，请提供签名实现容器");
+        }
+        hasSign = true;
         // 获取数字签名存储目录
         SignsDir signsDir = ofdDir.obtainDocDefault().obtainSigns();
         // 创建签名容器
@@ -301,7 +316,7 @@ public class OFDSigner implements Closeable {
             signsDir.setSignatures(signListObj);
 
             // 构造签名列表文件路径
-            signaturesLoc = signDir.getAbsLoc()
+            signaturesLoc = signsDir.getAbsLoc()
                     .cat(SignsDir.SignaturesFileName);
             // 设置OFD.xml 的签名列表文件入口
             try {
@@ -346,7 +361,10 @@ public class OFDSigner implements Closeable {
         // 设置签章原文的保护信息为：签名文件容器中绝对路径。
         String propertyInfo = signDir.getAbsLoc().cat(SignDir.SignatureFileName).toString();
         // 调用容器提供方法计算签章值。
-        byte[] signedValue = signContainer.sign(Files.newInputStream(signatureFilePath), propertyInfo);
+        byte[] signedValue;
+        try (InputStream inData = Files.newInputStream(signatureFilePath)) {
+            signedValue = signContainer.sign(inData, propertyInfo);
+        }
         Path signedValuePath = Paths.get(signDir.getSysAbsPath(), SignDir.SignedValueFileName);
         // 将签名值写入到 SignedValue.dat中
         Files.write(signedValuePath, signedValue);
@@ -362,10 +380,12 @@ public class OFDSigner implements Closeable {
      * @param signDir     签名资源容器
      * @param signListObj 签名列表描述对象
      * @return 签名文件文件系统路径
+     * @throws SignatureException 签名异常
+     * @throws IOException        文件读写IO操作异常
      */
     private Path buildSignature(SignsDir signsDir,
                                 SignDir signDir,
-                                Signatures signListObj) throws IOException {
+                                Signatures signListObj) throws IOException, SignatureException {
         // 构造签名信息
         SignedInfo signedInfo = new SignedInfo()
                 // 设置签名模块提供者信息
@@ -394,8 +414,7 @@ public class OFDSigner implements Closeable {
         if (!apList.isEmpty()) {
             for (StampAppearance sa : apList) {
                 // 解析除外观注解然后加入签名信息中
-                sa.getAppearance(ofdDir, MaxSignID)
-                        .forEach(signedInfo::addStampAnnot);
+                sa.getAppearance(reader, MaxSignID).forEach(signedInfo::addStampAnnot);
             }
         }
 
@@ -456,17 +475,13 @@ public class OFDSigner implements Closeable {
      * <p>
      * 然后关闭文档
      *
-     * @throws BadOFDException    文件解析失败，或文件不存在
-     * @throws IOException        签名和文件读写过程中的IO异常
-     * @throws SignatureException 签名异常
+     * @throws IOException 打包文件过程中IO异常
      */
     @Override
     public void close() throws IOException {
-        if (signContainer == null) {
-            throw new SignatureException("签名实现容器（signContainer）为空，请提供签名实现容器");
+        if (!hasSign) {
+            throw new IllegalStateException("请先执行 exeSign在关闭引擎完成数字签名。");
         }
-        // 设置电子签名
-        exeSign();
         // 打包电子签名后的OFD文件
         ofdDir.jar(out);
         // 关闭OFD解析器
