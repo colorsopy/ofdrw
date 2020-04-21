@@ -43,6 +43,10 @@ public class TBS_Sign extends ASN1Object {
      */
     private ExtensionDatas extDatas;
 
+    public TBS_Sign() {
+        super();
+    }
+
     public TBS_Sign(ASN1Integer version,
                     SESeal eseal,
                     ASN1GeneralizedTime timeInfo,
@@ -125,6 +129,11 @@ public class TBS_Sign extends ASN1Object {
 
     public TBS_Sign setPropertyInfo(DERIA5String propertyInfo) {
         this.propertyInfo = propertyInfo;
+        return this;
+    }
+
+    public TBS_Sign setPropertyInfo(String propertyInfo) {
+        this.propertyInfo = new DERIA5String(propertyInfo);
         return this;
     }
 
